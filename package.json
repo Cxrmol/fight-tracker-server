@@ -1,0 +1,19 @@
+{
+  "name": "fight-tracker-server",
+  "version": "1.0.0",
+  "description": "MMA League 25 - Fight Tracker API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "puppeteer": "^21.0.0",
+    "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
