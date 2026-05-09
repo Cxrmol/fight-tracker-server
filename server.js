@@ -6,20 +6,19 @@ const puppeteer = require('puppeteer');
 const app  = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── CONFIG (set as env vars on Railway) ──────────────────────────────────
+// ─── CONFIG ───────────────────────────────────────────────────────────────
 const TG_TOKEN   = process.env.TG_TOKEN   || '';
 const TG_CHAT_ID = process.env.TG_CHAT_ID || '';
 const TG_MINUTES = parseInt(process.env.TG_MINUTES || '5');
 const SMOOTHCOMP_URL = 'https://fmmaf.smoothcomp.com/fr/event/27760/schedule/matchlist';
-
-// Event days (ISO date strings, Europe/Paris timezone assumed)
 const EVENT_DAYS = { 1: '2026-05-09', 2: '2026-05-10' };
 
 // ─── STATE ────────────────────────────────────────────────────────────────
-let cachedMatches  = [];      // all parsed matches
-let lastFetchTime  = null;
-let isFetching     = false;
-let scheduledNotifs = new Set(); // matchIds already notified/scheduled
+let cachedMatches   = [];
+let lastFetchTime   = null;
+let isFetching      = false;
+let scheduledNotifs = new Set();
+let debugSnapshot   = null; // stores last raw scrape for /api/debug
 
 // ─── TELEGRAM ─────────────────────────────────────────────────────────────
 async function sendTelegram(text) {
@@ -38,121 +37,116 @@ async function sendTelegram(text) {
   }
 }
 
-// ─── PARSE MATCHES FROM HTML ──────────────────────────────────────────────
-function parseMatches(html) {
-  // We receive the full rendered HTML from Puppeteer.
-  // Smoothcomp structures match rows with these data attributes:
-  // data-time, and contains fighter profile links.
-  // We use regex since we don't have a DOM in Node.
+// ─── DOM-BASED EXTRACTION (primary method) ────────────────────────────────
+// Runs inside the browser via page.evaluate() — has full DOM access
+async function extractMatchesFromDOM(page) {
+  return await page.evaluate(() => {
+    const results = [];
+
+    // ── Strategy 1: rows containing exactly 2+ profile links ──
+    const allRows = document.querySelectorAll('tr, [class*="row"], [class*="match"], li');
+
+    allRows.forEach(row => {
+      const links = Array.from(row.querySelectorAll('a[href*="/profile/"]'));
+      const fighters = [...new Set(links.map(l => l.textContent.trim()).filter(n => n.length > 1))];
+      if (fighters.length < 2) return;
+
+      const rowText = row.textContent || '';
+
+      // Time
+      const timeMatch = rowText.match(/\b(\d{1,2}:\d{2})\b/);
+      const time = timeMatch ? timeMatch[1] : '';
+
+      // Cage / match number
+      const cageMatch = rowText.match(/\b(\d{1,2}-\d+)\b/)
+        || rowText.match(/(?:cage|mat|tapis)\s*[:#]?\s*(\d+)/i);
+      const rawCage = cageMatch ? cageMatch[1] : '';
+      const cage    = rawCage.includes('-') ? rawCage.split('-')[0] : rawCage;
+      const matchNum = rawCage;
+
+      // Category: look for a cell with weight/type info
+      let category = '';
+      const cells = Array.from(row.querySelectorAll('td, span, div'));
+      for (const c of cells) {
+        const t = (c.textContent || '').trim();
+        if (t.length > 3 && t.length < 120 &&
+            (t.includes('kg') || t.includes('lbs') || /AMA|PRO|ELITE/i.test(t))) {
+          category = t.replace(/\s+/g, ' ');
+          break;
+        }
+      }
+
+      // Day
+      let day = '';
+      const dayMatch = rowText.match(/jour\s*\d|samedi|dimanche/i);
+      if (dayMatch) day = dayMatch[0];
+
+      results.push({ fighter1: fighters[0], fighter2: fighters[1], time, cage, matchNum, category, day });
+    });
+
+    // ── Strategy 2: if nothing found, pair adjacent profile links ──
+    if (results.length === 0) {
+      const allLinks = Array.from(document.querySelectorAll('a[href*="/profile/"]'));
+      for (let i = 0; i + 1 < allLinks.length; i += 2) {
+        const fighter1 = allLinks[i].textContent.trim();
+        const fighter2 = allLinks[i + 1].textContent.trim();
+        if (!fighter1 || !fighter2 || fighter1 === fighter2) continue;
+
+        // Get surrounding container for time
+        const container = allLinks[i].closest('tr, [class*="row"], [class*="match"], li')
+          || allLinks[i].parentElement;
+        const blockText  = container ? container.textContent : '';
+        const timeMatch  = blockText.match(/\b(\d{1,2}:\d{2})\b/);
+        const cageMatch  = blockText.match(/\b(\d{1,2}-\d+)\b/);
+
+        results.push({
+          fighter1, fighter2,
+          time:     timeMatch ? timeMatch[1] : '',
+          cage:     cageMatch ? cageMatch[1].split('-')[0] : '',
+          matchNum: cageMatch ? cageMatch[1] : '',
+          category: '', day: ''
+        });
+      }
+    }
+
+    // ── Snapshot for /api/debug ──
+    const snapshot = {
+      title:        document.title,
+      url:          location.href,
+      bodyLength:   document.body.innerHTML.length,
+      profileLinks: document.querySelectorAll('a[href*="/profile/"]').length,
+      tableRows:    document.querySelectorAll('tr').length,
+      headings:     Array.from(document.querySelectorAll('h1,h2,h3')).slice(0, 8).map(el => el.textContent.trim()),
+      sampleHTML:   document.body.innerHTML.substring(0, 4000)
+    };
+
+    return { matches: results, snapshot };
+  });
+}
+
+// ─── FALLBACK: REGEX ON RAW HTML ──────────────────────────────────────────
+function parseMatchesFallback(html) {
   const matches = [];
-
-  // Extract all match blocks — each match is wrapped in a row with a time
-  // Pattern observed: time in format HH:MM, cage as a number, fighters as profile links
-  // We'll parse line by line after stripping tags
-
-  // Step 1: extract fighter names from profile links
-  const profileRe = /href="[^"]*\/profile\/[^"]*"[^>]*>([^<]{2,50})<\/a>/gi;
-  const fighters = [];
+  // Pair consecutive profile links within 500 chars of each other
+  const blockRe = /href="[^"]*\/profile\/[^"]*"[^>]*>([^<]{2,50})<\/a>[\s\S]{0,600}?href="[^"]*\/profile\/[^"]*"[^>]*>([^<]{2,50})<\/a>/gi;
   let m;
-  while ((m = profileRe.exec(html)) !== null) {
-    const name = m[1].trim();
-    if (name && !fighters.includes(name)) fighters.push(name);
+  while ((m = blockRe.exec(html)) !== null) {
+    const block    = m[0];
+    const fighter1 = m[1].trim();
+    const fighter2 = m[2].trim();
+    if (!fighter1 || !fighter2 || fighter1 === fighter2) continue;
+
+    const timeMatch = block.match(/\b(\d{1,2}:\d{2})\b/);
+    const cageMatch = block.match(/\b(\d{1,2}-\d+)\b/);
+
+    matches.push({
+      fighter1, fighter2,
+      time:     timeMatch ? timeMatch[1] : '',
+      cage:     cageMatch ? cageMatch[1].split('-')[0] : '',
+      matchNum: cageMatch ? cageMatch[1] : '',
+      category: '', day: ''
+    });
   }
-
-  // Step 2: strip HTML tags and get clean text lines
-  const text = html
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&#\d+;/g, ' ')
-    .split('\n')
-    .map(l => l.trim())
-    .filter(l => l.length > 0);
-
-  let currentCategory = '';
-  let currentDay      = '';
-  let fighterIdx      = 0;
-
-  for (let i = 0; i < text.length; i++) {
-    const line = text[i];
-
-    // Detect category lines (contain "/" and weight info)
-    if (line.includes('/') && (line.includes('kg') || line.includes('lbs') || /AMA|PRO|ELITE/i.test(line))) {
-      currentCategory = line.replace(/\s+/g, ' ').trim();
-      // Look for day on next line
-      if (i + 1 < text.length && /jour\s*\d/i.test(text[i + 1])) {
-        currentDay = text[i + 1].replace(/[()]/g, '').trim();
-        i++;
-      }
-      continue;
-    }
-
-    // Detect day lines
-    if (/^\(?jour\s*\d/i.test(line) || /samedi|dimanche/i.test(line)) {
-      currentDay = line.replace(/[()]/g, '').trim();
-      continue;
-    }
-
-    // Detect time lines (HH:MM)
-    if (/^\d{1,2}:\d{2}$/.test(line)) {
-      const time = line;
-      let cage = '', matchNum = '';
-
-      // Look backward for cage/match number
-      for (let j = i - 1; j >= Math.max(0, i - 6); j--) {
-        const prev = text[j];
-        if (/^\d+-\d+$/.test(prev)) {
-          cage     = prev.split('-')[0];
-          matchNum = prev;
-          break;
-        }
-        if (/^\d+$/.test(prev) && parseInt(prev) <= 20) {
-          cage     = prev;
-          matchNum = prev;
-          break;
-        }
-      }
-
-      // Get fighter names (prefer profile links, fallback to text lines)
-      let fighter1 = '', fighter2 = '';
-      if (fighters.length > fighterIdx) {
-        fighter1 = fighters[fighterIdx]     || '';
-        fighter2 = fighters[fighterIdx + 1] || '';
-        fighterIdx += 2;
-      } else {
-        // Fallback: look at next non-empty lines
-        let k = i + 1;
-        while (k < text.length && text[k].length < 3) k++;
-        if (k < text.length) {
-          if (text[k].includes('   ')) {
-            const parts = text[k].split(/\s{3,}/);
-            fighter1 = parts[0].trim();
-            fighter2 = (parts[1] || '').trim();
-          } else {
-            fighter1 = text[k];
-            if (k + 1 < text.length && text[k + 1].length > 2 && !/^\d{1,2}:\d{2}$/.test(text[k + 1])) {
-              fighter2 = text[k + 1];
-            }
-          }
-        }
-      }
-
-      matches.push({
-        time,
-        cage,
-        matchNum,
-        fighter1: fighter1 || 'TBD',
-        fighter2: fighter2 || 'TBD',
-        category: currentCategory,
-        day:      currentDay
-      });
-    }
-  }
-
   return matches;
 }
 
@@ -166,6 +160,7 @@ async function scrapeMatches() {
   try {
     browser = await puppeteer.launch({
       headless: 'new',
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -177,45 +172,69 @@ async function scrapeMatches() {
     });
 
     const allMatches = [];
+    const snapshots  = [];
 
-    // Scrape all pages (1 to 4)
-    for (let page = 1; page <= 4; page++) {
-      const url = SMOOTHCOMP_URL + '?page=' + page;
+    for (let pageNum = 1; pageNum <= 4; pageNum++) {
+      const url = SMOOTHCOMP_URL + '?page=' + pageNum;
+      let tab;
       try {
-        const tab = await browser.newPage();
+        tab = await browser.newPage();
         await tab.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36');
         await tab.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
 
-        // Wait for match content to appear
+        // Wait for fighter profile links to load
         try {
-          await tab.waitForSelector('a[href*="/profile/"], .match-row, [class*="schedule"]', { timeout: 10000 });
-        } catch(e) {
-          console.log('[scrape] Selector timeout on page', page, '- trying anyway');
+          await tab.waitForSelector('a[href*="/profile/"]', { timeout: 12000 });
+        } catch (e) {
+          console.log(`[scrape] No profile links on page ${pageNum} — page may be empty`);
         }
 
-        // Extra wait for dynamic content
-        await new Promise(r => setTimeout(r, 2000));
+        // Extra wait for JS rendering
+        await new Promise(r => setTimeout(r, 2500));
 
-        const html = await tab.content();
-        const matches = parseMatches(html);
-        console.log('[scrape] Page', page, ':', matches.length, 'matches found');
-        allMatches.push(...matches);
+        // Primary: DOM extraction
+        const { matches: domMatches, snapshot } = await extractMatchesFromDOM(tab);
+        snapshots.push({ page: pageNum, ...snapshot });
+        console.log(`[scrape] Page ${pageNum}: ${domMatches.length} matches (DOM), ${snapshot.profileLinks} profile links`);
+
+        if (domMatches.length > 0) {
+          allMatches.push(...domMatches);
+        } else {
+          // Fallback: regex on raw HTML
+          const html = await tab.content();
+          const fallback = parseMatchesFallback(html);
+          console.log(`[scrape] Page ${pageNum}: ${fallback.length} matches (fallback regex)`);
+          allMatches.push(...fallback);
+        }
+
         await tab.close();
       } catch (e) {
-        console.error('[scrape] Error on page', page, ':', e.message);
+        console.error(`[scrape] Error on page ${pageNum}:`, e.message);
+        if (tab) await tab.close().catch(() => {});
       }
     }
 
     await browser.close();
+    debugSnapshot = snapshots;
 
-    if (allMatches.length > 0) {
-      cachedMatches = allMatches;
+    // Deduplicate by sorted fighter pair
+    const seen   = new Set();
+    const unique = allMatches.filter(m => {
+      const key = [m.fighter1, m.fighter2].sort().join('||');
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+
+    if (unique.length > 0) {
+      cachedMatches = unique;
       lastFetchTime = new Date().toISOString();
-      console.log('[scrape] Total:', cachedMatches.length, 'matches cached');
+      console.log(`[scrape] ✅ ${cachedMatches.length} unique matches cached`);
       scheduleNotifications();
     } else {
-      console.warn('[scrape] No matches found — keeping previous cache');
+      console.warn('[scrape] ⚠️  No matches found — keeping previous cache');
     }
+
   } catch (e) {
     console.error('[scrape] Fatal error:', e.message);
     if (browser) await browser.close().catch(() => {});
@@ -224,10 +243,9 @@ async function scrapeMatches() {
   }
 }
 
-// ─── SCHEDULE TELEGRAM NOTIFICATIONS ─────────────────────────────────────
+// ─── TELEGRAM NOTIFICATIONS ───────────────────────────────────────────────
 function scheduleNotifications() {
   if (!TG_TOKEN || !TG_CHAT_ID) return;
-
   const now = Date.now();
 
   cachedMatches.forEach(m => {
@@ -240,32 +258,33 @@ function scheduleNotifications() {
     const notifTime = fightDate.getTime() - TG_MINUTES * 60 * 1000;
     const msUntil   = notifTime - now;
 
-    // Only schedule if it's in the future (and not more than 24h away)
     if (msUntil > 0 && msUntil < 24 * 60 * 60 * 1000) {
       scheduledNotifs.add(matchId);
-
       setTimeout(async () => {
         const cage = m.cage ? ` · Cage ${m.cage}` : '';
-        const msg  =
+        await sendTelegram(
           `🥊 <b>Combat dans ${TG_MINUTES} min !</b>\n\n` +
           `⚔️ ${m.fighter1} vs ${m.fighter2}\n` +
           `⏰ ${m.time}${cage}\n` +
-          `📋 ${m.category}`;
-        await sendTelegram(msg);
+          `📋 ${m.category}`
+        );
       }, msUntil);
-
-      console.log(`[notif] Scheduled: ${m.fighter1} vs ${m.fighter2} @ ${m.time} in ${Math.round(msUntil/60000)} min`);
+      console.log(`[notif] Scheduled: ${m.fighter1} vs ${m.fighter2} in ${Math.round(msUntil/60000)} min`);
     } else if (msUntil <= 0 && msUntil > -5 * 60 * 1000) {
-      // Fight started less than 5 min ago, send now
       scheduledNotifs.add(matchId);
       const cage = m.cage ? ` · Cage ${m.cage}` : '';
-      sendTelegram(`🥊 <b>Combat en cours !</b>\n\n⚔️ ${m.fighter1} vs ${m.fighter2}\n⏰ ${m.time}${cage}\n📋 ${m.category}`);
+      sendTelegram(
+        `🥊 <b>Combat en cours !</b>\n\n` +
+        `⚔️ ${m.fighter1} vs ${m.fighter2}\n` +
+        `⏰ ${m.time}${cage}\n` +
+        `📋 ${m.category}`
+      );
     }
   });
 }
 
 function parseFightDate(m) {
-  const d = (m.day || '').toLowerCase();
+  const d      = (m.day || '').toLowerCase();
   const dayNum = /jour\s*2|j2|dimanche/i.test(d) ? 2 : 1;
   const dateStr = EVENT_DAYS[dayNum];
   if (!m.time || !m.time.includes(':')) return null;
@@ -275,37 +294,36 @@ function parseFightDate(m) {
   return isNaN(dt.getTime()) ? null : dt;
 }
 
-// ─── CORS ─────────────────────────────────────────────────────────────────
+// ─── MIDDLEWARE ───────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
 
 // ─── ROUTES ───────────────────────────────────────────────────────────────
-// Health check
 app.get('/', (req, res) => {
-  res.json({
-    status:     'ok',
-    matches:    cachedMatches.length,
-    lastFetch:  lastFetchTime,
-    isFetching
-  });
+  res.json({ status: 'ok', matches: cachedMatches.length, lastFetch: lastFetchTime, isFetching });
 });
 
-// Main API endpoint
 app.get('/api/matches', (req, res) => {
+  res.json({ matches: cachedMatches, lastFetch: lastFetchTime, total: cachedMatches.length });
+});
+
+// Debug: shows what was scraped, helps fix parsing issues
+app.get('/api/debug', (req, res) => {
   res.json({
-    matches:   cachedMatches,
+    cachedMatchesCount: cachedMatches.length,
+    cachedMatchesSample: cachedMatches.slice(0, 5),
     lastFetch: lastFetchTime,
-    total:     cachedMatches.length
+    isFetching,
+    scrapeSnapshots: debugSnapshot
   });
 });
 
-// Force refresh (useful for testing)
 app.post('/api/refresh', async (req, res) => {
   res.json({ message: 'Refresh started' });
   await scrapeMatches();
 });
 
-// ─── CRON: refresh every 10 minutes ───────────────────────────────────────
+// ─── CRON: every 10 min ───────────────────────────────────────────────────
 cron.schedule('*/10 * * * *', () => {
   console.log('[cron] Scheduled refresh');
   scrapeMatches();
@@ -313,7 +331,6 @@ cron.schedule('*/10 * * * *', () => {
 
 // ─── START ────────────────────────────────────────────────────────────────
 app.listen(PORT, async () => {
-  console.log(`[server] Fight Tracker API running on port ${PORT}`);
-  // Initial scrape on startup
+  console.log(`[server] Fight Tracker API on port ${PORT}`);
   await scrapeMatches();
 });
